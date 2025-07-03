@@ -4,7 +4,7 @@ import os
 import shutil
 import collections
 import time
-from google.cloud import storage
+# from google.cloud import storage
 from pathlib import Path
 from typing import Tuple, Union
 from contextlib import nullcontext
@@ -28,7 +28,7 @@ from experiments.causal_trace import ModelAndTokenizer, predict_token
 from experiments.causal_trace import layername, corrupted_forward_pass, find_token_range, make_inputs, simple_make_inputs
 from experiments.py.eval_utils_counterfact import compute_rewrite_quality_counterfact
 from experiments.py.eval_utils_zsre import compute_rewrite_quality_zsre
-from rome import ROMEHyperParams, apply_rome_to_model
+from rome import ROMEHyperParams, apply_rome_to_model, apply_rome_noise_to_model
 from memit import MEMITHyperParams, apply_memit_to_model
 from util import nethook
 from util.fewshot_utils import predict_model, fewshot_accuracy_sum, score_from_batch
@@ -37,6 +37,7 @@ from util.globals import *
 
 ALG_DICT = {
     "ROME": (ROMEHyperParams, apply_rome_to_model),
+    "ROME_NOISE": (ROMEHyperParams, apply_rome_noise_to_model),
     "MEMIT": (MEMITHyperParams, apply_memit_to_model),
     "FT": (FTHyperParams, apply_ft_to_model),
     "KN": (KNHyperParams, apply_kn_to_model),
@@ -50,9 +51,9 @@ DS_DICT = {
     # "zsre": (MENDQADataset, compute_rewrite_quality_zsre),
 }
 
-CODE_DIR='/home/peter/private/belief-localization/third_party'
-BASE_DIR='/home/peter/private/belief-localization'
-MODEL_DIR='/playpen/peter/models'
+CODE_DIR='/mnt/sda/hoyeon/belief-localization/third_party'
+BASE_DIR='/mnt/sda/hoyeon/belief-localization'
+MODEL_DIR='/mnt/sda/hoyeon/.cache/models'
 
 def get_override_hparams(args, window_size, central_layer, alg_name):
   # embeddings are being FTed
@@ -136,48 +137,58 @@ def get_override_hparams(args, window_size, central_layer, alg_name):
   return return_dict
 
 def sweep_experiment_name(args, model_name, alg_name, ds_name, sweep_params):
-  if args.fact_token == "last":
-    alg_name += "-last"
-  exp_name = f'{model_name}_{alg_name}_outputs_{ds_name}_editing_sweep'  
-  for k,v in sweep_params.items():
-    _v = str(v).replace(", ", "-")
-    if _v == "-1":
-        _v = "embeds"
-    if _v == "-2":
-        _v = "all"
-    exp_name += f"_{k[:5]}-{_v}"
-  if args.tracing_reversal:
-    obj = '_trace-reverse'
-  elif args.fact_forcing:
-    obj = '_fact-forcing'
-  elif args.fact_erasure:
-    obj = '_fact-erasure'
-  elif args.fact_amplification:
-    obj = '_fact-amplification'
-  elif args.weight_based_tracing:
-    obj = '_weight-tracing'
-  else:
-    obj = ''
-  return f'{exp_name}{obj}_n{args.dataset_size_limit}'
+    if args.fact_token == "last":
+        alg_name += "-last"
+    
+    # ADD THIS: Include noise strategy in algorithm name
+    if alg_name == "ROME_NOISE" and hasattr(args, 'noise_matching_strategy'):
+        alg_name += f"-{args.noise_matching_strategy}"
+    
+    exp_name = f'{model_name}_{alg_name}_outputs_{ds_name}_editing_sweep'  
+    for k,v in sweep_params.items():
+        _v = str(v).replace(", ", "-")
+        if _v == "-1":
+            _v = "embeds"
+        if _v == "-2":
+            _v = "all"
+        exp_name += f"_{k[:5]}-{_v}"
+    if args.tracing_reversal:
+        obj = '_trace-reverse'
+    elif args.fact_forcing:
+        obj = '_fact-forcing'
+    elif args.fact_erasure:
+        obj = '_fact-erasure'
+    elif args.fact_amplification:
+        obj = '_fact-amplification'
+    elif args.weight_based_tracing:
+        obj = '_weight-tracing'
+    else:
+        obj = ''
+    return f'{exp_name}{obj}_n{args.dataset_size_limit}'
 
 def ROME_experiment_name(args, model_name, alg_name, ds_name, hparams_to_add):
-  exp_name = f'{model_name}/{alg_name}_outputs_{ds_name}'
-  if args.tracing_reversal:
-    hparams_to_add['trace-reverse'] = 'T'
-  if args.fact_forcing:
-    hparams_to_add['fact-forcing'] = 'T'
-  if args.fact_erasure:
-    hparams_to_add['min'] = 'T'
-  if args.fact_amplification:
-    hparams_to_add['ampfy'] = 'T'
-  if args.weight_based_tracing:
-    hparams_to_add['weight-based'] = 'T'
-  for k,v in hparams_to_add.items():
-    _v = str(v).replace(", ", "-")
-    if _v == "-1":
-        _v = "embeds"
-    exp_name += f"_{k[:5]}-{_v}"
-  return exp_name
+    exp_name = f'{model_name}/{alg_name}_outputs_{ds_name}'
+    if args.tracing_reversal:
+        hparams_to_add['trace-reverse'] = 'T'
+    if args.fact_forcing:
+        hparams_to_add['fact-forcing'] = 'T'
+    if args.fact_erasure:
+        hparams_to_add['min'] = 'T'
+    if args.fact_amplification:
+        hparams_to_add['ampfy'] = 'T'
+    if args.weight_based_tracing:
+        hparams_to_add['weight-based'] = 'T'
+    
+    # ADD THIS: Include noise strategy for ROME_NOISE
+    if alg_name == "ROME_NOISE" and hasattr(args, 'noise_matching_strategy'):
+        hparams_to_add['noise-strategy'] = args.noise_matching_strategy
+    
+    for k,v in hparams_to_add.items():
+        _v = str(v).replace(", ", "-")
+        if _v == "-1":
+            _v = "embeds"
+        exp_name += f"_{k[:5]}-{_v}"
+    return exp_name
 
 def ROME_experiment_name_from_override_params(args, model_name, alg_name, ds_name, override_hparams, hparams_class):
   _model_name = model_name.replace('/', '_')
@@ -606,7 +617,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--alg_name",
-        choices=["ROME", "FT", "KN", "MEND", "KE", "MEMIT"],
+        choices=["ROME", "ROME_NOISE", "FT", "KN", "MEND", "KE", "MEMIT"],
         default="ROME",
         help="Editing algorithm to use. Results are saved in results/<alg_name>/<run_id>, "
         "where a new run_id is generated on each run. "
@@ -614,8 +625,14 @@ if __name__ == "__main__":
         required=True,
     )
     parser.add_argument(
+        "--noise_matching_strategy",
+        choices=["random_rank1", "full_rank", "scaled_random"],
+        default="random_rank1",
+        help="Strategy for matching noise to ROME delta matrix",
+    )
+    parser.add_argument(
         "--model_name",
-        choices=["gpt2-medium", "gpt2-large", "gpt2-xl", "EleutherAI/gpt-j-6B"],
+        choices=["gpt2-medium", "gpt2-large", "gpt2-xl", "EleutherAI/gpt-j-6b"],
         default="gpt2-xl",
         help="Model to edit.",
         required=True,
@@ -808,14 +825,23 @@ if __name__ == "__main__":
     num_points = args.dataset_size_limit
     alg_name = args.alg_name
     model_name = args.model_name
-    assert alg_name in ["FT", "ROME", "MEMIT"]
+    assert alg_name in ["FT", "ROME", "MEMIT", "ROME_NOISE"]
     hparams_class, _ = ALG_DICT[alg_name]
     ds_name = args.ds_name
     window_sizes = [int(x) for x in args.window_sizes.split()]
-    if 'gpt2' in model_name:
-        central_layers = list(range(0, 48, 4)) + [17, 47]
+    if model_name == 'gpt2':
+        central_layers = list(range(0, 12, 2)) + [5, 11]  # [0, 2, 4, 6, 8, 10, 5, 11]
+        num_layers = 12
+    elif model_name == 'gpt2-medium':
+        central_layers = list(range(0, 24, 3)) + [8, 23]  # [0, 3, 6, 9, 12, 15, 18, 21, 8, 23]
+        num_layers = 24
+    elif model_name == 'gpt2-large':
+        central_layers = list(range(0, 36, 4)) + [12, 35]  # [0, 4, 8, 12, 16, 20, 24, 28, 32, 12, 35]
+        num_layers = 36
+    elif model_name == 'gpt2-xl':
+        central_layers = list(range(0, 48, 4)) + [17, 47]  # [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 17, 47]
         num_layers = 48
-    if '6B' in model_name:
+    elif '6B' in model_name:
         central_layers = list(range(0, 28, 4)) + [5, 27]
         num_layers = 28
         if ds_name == 'zsre':

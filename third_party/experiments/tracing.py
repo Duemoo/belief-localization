@@ -38,7 +38,7 @@ from util.fewshot_utils import first_appearance_fewshot_accuracy_sum, fewshot_ac
 # globals
 CODE_DIR='/home/peter/private/belief-localization/third_party'
 BASE_DIR='/home/peter/private/belief-localization'
-MODEL_DIR='/playpen/peter/models'
+MODEL_DIR='/mnt/sda/hoyeon/belief-localization/models'
 
 # functions
 def load_counterfact_dataset(args):

@@ -12,6 +12,14 @@ from typing import Dict, List, Tuple, Optional, Union
 from dataclasses import dataclass
 import copy
 import warnings
+import time, contextlib
+import bisect
+import wandb, time
+import torch.multiprocessing as mp
+import os, math
+from pymoo.core.callback import Callback
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from dsets import CounterFactDataset
 
 from pymoo.core.problem import Problem
 from pymoo.core.callback import Callback
@@ -20,16 +28,123 @@ from pymoo.operators.crossover.sbx import SBX
 from pymoo.operators.mutation.pm import PolynomialMutation
 from pymoo.operators.sampling.rnd import IntegerRandomSampling
 from pymoo.operators.selection.tournament import TournamentSelection
+from pymoo.operators.sampling.rnd import PermutationRandomSampling
+from pymoo.operators.crossover.ox import OrderCrossover
+from pymoo.operators.mutation.inversion import InversionMutation
 from pymoo.optimize import minimize
 from pymoo.core.repair import Repair
+
 
 from util import nethook
 from baselines.ft import FTHyperParams, apply_ft_to_model
 from experiments.py.eval_utils_counterfact import compute_rewrite_quality_counterfact
 from dsets import AttributeSnippets
 
+import random
+
+torch.autograd.set_detect_anomaly(True)
+RNG = random.Random(0xC0FFEE)
+
 LOGIT_CLIP = 10.0          # prevents huge margins dominating
 SIGMOID_STEEPNESS = 5.0    # α in σ(αΔ); change if you prefer sharper/softer curves
+
+def worker_main(rank, gpu_id, shared_cfg, data_subset):
+    torch.cuda.set_device(gpu_id)
+
+    # deep-copy the config so each worker can tweak device/fp16 flag
+    cfg = copy.deepcopy(shared_cfg)
+    cfg.device = f"cuda:{gpu_id}"
+
+    # load model *on this GPU only*
+    model = AutoModelForCausalLM.from_pretrained(
+        cfg.model_name, torch_dtype=torch.float32, device_map={"" : gpu_id}
+    )
+    tok   = AutoTokenizer.from_pretrained(cfg.model_name)
+    tok.pad_token = tok.eos_token
+
+    results = run_adversarial_localization_per_datapoint(
+        model, tok, data_subset, cfg
+    )
+
+    # save partial result
+    with open(f"{cfg.save_dir}/partial_{rank}.pkl", "wb") as f:
+        pickle.dump(results, f)
+
+def launch_parallel(dataset, cfg, gpus=None, workers_per_gpu=1):
+    if gpus is None:
+        gpus = list(range(torch.cuda.device_count()))
+
+    chunks = [[] for _ in range(len(gpus) * workers_per_gpu)]
+    for i, rec in enumerate(dataset):
+        chunks[i % len(chunks)].append(rec)
+
+    procs = []
+    rank  = 0
+    for gpu in gpus:
+        for _ in range(workers_per_gpu):
+            p = mp.Process(
+                target=worker_main,
+                args=(rank, gpu, cfg, chunks[rank])
+            )
+            p.start(); procs.append(p); rank += 1
+
+    for p in procs: p.join()
+
+    # merge partial pickles
+    merged = {}
+    for r in range(rank):
+        with open(f"{cfg.save_dir}/partial_{r}.pkl", "rb") as f:
+            merged.update(pickle.load(f))
+        os.remove(f"{cfg.save_dir}/partial_{r}.pkl")
+    with open(f"{cfg.save_dir}/summary_results.pkl", "wb") as f:
+        pickle.dump(merged, f)
+    print(f"Parallel run complete.  {len(merged)} records processed.")
+
+def _safe_cross_entropy(logits, target):
+    if logits.shape[0] != target.shape[0]:
+        raise ValueError(f"Logits shape {logits.shape} does not match target shape {target.shape}")
+    if logits.dim() != 2 or target.dim() != 1:
+        raise ValueError(f"Expected logits to be 2D and target to be 1D, got {logits.dim()}D and {target.dim()}D")
+    if not torch.isfinite(logits).all():
+        raise RuntimeError("Non-finite logits detected")
+    loss = torch.nn.functional.cross_entropy(logits, target)
+    if not torch.isfinite(loss):
+        raise RuntimeError("Non-finite CE loss")
+    return loss
+
+@contextlib.contextmanager
+def stopwatch(msg: str):
+    """Context-manager that prints elapsed time with a [T] prefix."""
+    t0 = time.perf_counter()
+    yield
+    dt = time.perf_counter() - t0
+    print(f"[T] {msg:<45s}: {dt:6.2f} s")
+
+class ScalarRepair(Repair):
+    """Ensure we always return exactly N distinct indices < total_params."""
+    def __init__(self, total_params: int, n_select: int):
+        super().__init__()
+        self.total = total_params
+        self.n    = n_select
+
+    def _do(self, problem, X, **kwargs):
+        for i in range(len(X)):
+            # 1) clip to bounds
+            X[i] = np.clip(X[i], 0, self.total-1).astype(int)
+            # 2) deduplicate while preserving order
+            uniq = []
+            seen = set()
+            for idx in X[i]:
+                if idx not in seen:
+                    uniq.append(idx); seen.add(idx)
+            # 3) pad with fresh random indices if needed
+            if len(uniq) < self.n:
+                missing = self.n - len(uniq)
+                pool = np.setdiff1d(np.arange(self.total), uniq, assume_unique=True)
+                uniq.extend(np.random.choice(pool, missing, replace=False))
+            # 4) truncate in case we somehow got too many
+            X[i,:] = np.array(uniq[:self.n], dtype=int)
+        return X
 
 def margin_log_prob(target_logits: torch.Tensor,
                     baseline_logits: torch.Tensor) -> float:
@@ -62,7 +177,7 @@ class AdversarialConfig:
     # Evolution parameters
     population_size: int = 30  # Reduced for memory efficiency
     max_generations: int = 25
-    crossover_prob: float = 0.7
+    crossover_prob: float = 0.4
     mutation_prob: float = 0.2
     
     # Metric weights (rewrite + generalization + locality)
@@ -73,13 +188,16 @@ class AdversarialConfig:
     
     # Fine-tuning parameters
     ft_steps: int = 30  # Reduced for efficiency
-    ft_lr: float = 5e-5  # More conservative for fp16
+    ft_lr: float = 1e-5  # More conservative for fp16
     ft_norm_constraint: float = 1e-4
     use_grad_scaler: bool = True  # For fp16 stability
     
     # Saving
     save_dir: str = "adversarial_results"
     save_frequency: int = 10
+    
+    # Evaluation parameters
+    fixed_eval_size: int = 100  # Fixed size for evaluation records
 
 
 class IntegerMutation:
@@ -140,13 +258,17 @@ class ParameterBackup:
 
 class AdversarialLocalizationProblem(Problem):
     """
-    Memory-efficient per-datapoint adversarial localization
+    Search _one_ mask that works for a fixed *set* of records.
     """
-    
-    def __init__(self, model, tokenizer, record: Dict, config: AdversarialConfig):
+
+    def __init__(self,
+                model,
+                tokenizer,
+                eval_records: List[Dict],   # fixed set chosen by caller
+                config: AdversarialConfig):
         self.model = model
         self.tokenizer = tokenizer
-        self.record = record
+        self.records = eval_records
         self.config = config
         self.device = config.device
         
@@ -161,11 +283,43 @@ class AdversarialLocalizationProblem(Problem):
             self.grad_scaler = None
         
         # Check if record has required data
-        self._validate_record()
-        
+        for rec in self.records:
+            self._validate_record(rec)
+            
         # Analyze model structure
         self.layer_info = self._analyze_model_layers()
         self.total_params = sum(p.numel() for p in model.parameters())
+        self.editable = []          # tuples: (name, global_start, global_end,
+                                    #                   editable_start, editable_end)
+        g_off = e_off = 0
+        for name, p in self.model.named_parameters():
+            size = p.numel()
+            if (".attn." in name or ".mlp." in name) and (".bias" not in name) \
+            and ("ln_" not in name and ".ln_" not in name):
+                self.editable.append((name, g_off, g_off+size,
+                                        e_off, e_off+size))
+                e_off += size          # advance *editable* offset
+            g_off += size              # always advance global offset
+
+        self.total_editable = e_off
+        cum_ends = [tpl[4] for tpl in self.editable]   # editable cumulative ends
+        assert self.total_editable == cum_ends[-1], "editable space mismatch"
+        
+        # sanity: every random idx is mappable
+        for _ in range(1000):
+            i = RNG.randrange(self.total_editable)
+            m  = self._create_scalar_mask(np.array([i]))
+            
+        SAFE_TENSORS = (".ln_", ".bias")          # never touch those
+        self.editable = [tpl for tpl in self.editable
+                        if not any(key in tpl[0] for key in SAFE_TENSORS)]
+        self.total_editable = self.editable[-1][4]
+        
+        # allow only {attn,mlp}.{wq, wk, wv, wo, c_fc, c_proj}
+        SAFE = (".ln_", ".bias", ".wpe", ".wte")     #  GPT-2 names
+        self.editable = [tpl for tpl in self.editable
+                        if not any(tok in tpl[0] for tok in SAFE)]
+        self.total_editable = self.editable[-1][2] - self.editable[0][1]
         
         # Set up search space
         if config.search_mode == "layer":
@@ -180,8 +334,8 @@ class AdversarialLocalizationProblem(Problem):
                 self.target_param_count = config.target_param_count
             
             n_var = self.target_param_count
-            xl = np.zeros(n_var)
-            xu = np.full(n_var, self.total_params - 1)
+            xl = np.zeros(self.target_param_count, dtype=int)
+            xu = np.full(self.target_param_count, self.total_editable-1, dtype=int)
             vtype = int
         
         print(f"Search mode: {config.search_mode}")
@@ -203,17 +357,17 @@ class AdversarialLocalizationProblem(Problem):
             vtype=vtype
         )
     
-    def _validate_record(self):
+    def _validate_record(self, rec):
         """Validate that record has required fields"""
         required_fields = ["requested_rewrite"]
         for field in required_fields:
-            if field not in self.record:
+            if field not in rec:
                 raise ValueError(f"Record missing required field: {field}")
         
         # Check for neighborhood prompts if locality weight > 0
-        if (self.config.locality_weight > 0 and 
+        if (self.config.locality_weight > 0 and
             self.config.skip_no_neighbors and
-            "neighborhood_prompts" not in self.record):
+            "neighborhood_prompts" not in rec):
             raise ValueError("Record has no neighborhood prompts but locality_weight > 0")
     
     def _analyze_model_layers(self) -> List[Tuple[str, int]]:
@@ -249,25 +403,24 @@ class AdversarialLocalizationProblem(Problem):
             return layer_params // 3
         return 50000
     
+    # ------------------------------------------------------------------ #
+    #  Pymoo entry-point: evaluate a batch of candidate masks            #
+    # ------------------------------------------------------------------ #
     def _evaluate(self, X, out, *args, **kwargs):
-        """Evaluate population efficiently"""
-        fitness_values = []
-        
-        for i in range(X.shape[0]):
+        vals = []
+        for i, cand in enumerate(X):
             if self.config.search_mode == "layer":
-                layer_idx = int(X[i, 0])
-                param_mask = self._create_layer_mask(layer_idx)
+                param_mask = self._create_layer_mask(int(cand[0]))
             else:
-                param_indices = X[i].astype(int)
-                param_mask = self._create_scalar_mask(param_indices)
-            
-            # Evaluate this parameter mask with memory-efficient backup
-            fitness = self._evaluate_parameter_mask_efficient(param_mask)
-            fitness_values.append(fitness)
-        
-        # Negate for minimization
-        out["F"] = np.array([[-f] for f in fitness_values])
-    
+                param_mask = self._create_scalar_mask(cand.astype(int))
+
+            r, g, l = self._score_mask(param_mask)
+            if not np.isfinite([r, g, l]).all():
+                raise RuntimeError(f"NaN/Inf detected  r={r} g={g} l={l}")
+            vals.append(-self._combine(r, g, l))   # negative ⇒ pymoo minimises
+
+        out["F"] = np.asarray(vals).reshape(-1, 1)
+
     def _create_layer_mask(self, layer_idx: int) -> Dict[str, torch.Tensor]:
         """Create mask for entire layer"""
         if layer_idx >= len(self.layer_info):
@@ -283,59 +436,36 @@ class AdversarialLocalizationProblem(Problem):
                 param_mask[name] = torch.zeros_like(param, dtype=torch.bool)
         
         return param_mask
+
+
+    def _create_scalar_mask(self, flat_idx: np.ndarray) -> Dict[str, torch.Tensor]:
+        flat_idx = np.unique(flat_idx)
+        mask = {name: torch.zeros_like(self.model.get_parameter(name),
+                                    dtype=torch.bool, device=self.device)
+                for name, *_ in self.editable}
+
+        cum_ends = [tpl[4] for tpl in self.editable]          # editable ends
+        for idx in flat_idx:
+            t = bisect.bisect_left(cum_ends, idx+1)           # +1 keeps it inclusive
+            name, g_start, g_end, e_start, _ = self.editable[t]
+            local = idx - e_start                             # 0 ≤ local < size
+            mask[name].view(-1)[local] = True
+        return mask
+
+
     
-    def _create_scalar_mask(self, param_indices: np.ndarray) -> Dict[str, torch.Tensor]:
-        """Create mask for specific parameter indices"""
-        param_mask = {}
-        global_idx = 0
+    # ------------------------------------------------------------------ #
+    #  Evaluate one mask on ONE record                                   #
+    # ------------------------------------------------------------------ #
+    def _evaluate_on_record(self, rec, param_mask):
+        backup = ParameterBackup(self.model, param_mask)
         
-        for name, param in self.model.named_parameters():
-            param_size = param.numel()
-            
-            # Find selected indices in this parameter
-            selected_locals = []
-            for idx in param_indices:
-                if global_idx <= idx < global_idx + param_size:
-                    selected_locals.append(idx - global_idx)
-            
-            # Create boolean mask
-            mask = torch.zeros(param_size, dtype=torch.bool, device=param.device)
-            if selected_locals:
-                mask[selected_locals] = True
-            
-            param_mask[name] = mask.view(param.shape)
-            global_idx += param_size
+        # Set up gradient masking
+        self._setup_gradient_masking(param_mask)
         
-        return param_mask
-    
-    def _evaluate_parameter_mask_efficient(self, param_mask: Dict[str, torch.Tensor]) -> float:
-        """Memory-efficient evaluation with parameter backup/restore"""
-        try:
-            # Create backup of selected parameters
-            backup = ParameterBackup(self.model, param_mask)
-            
-            # Set up gradient masking
-            self._setup_gradient_masking(param_mask)
-            
-            # Fine-tune and evaluate
-            metrics = self._finetune_and_evaluate_efficient()
-            
-            # Restore original parameters
-            backup.restore(self.model)
-            
-            # Compute weighted fitness
-            fitness = self._compute_fitness(metrics)
-            
-            return fitness
-            
-        except Exception as e:
-            print(f"Error evaluating mask: {e}")
-            # Ensure model is restored even on error
-            try:
-                backup.restore(self.model)
-            except:
-                pass
-            return 0.0
+        metrics = self._finetune_and_evaluate_efficient(rec)
+        backup.restore(self.model)
+        return metrics["rewrite_score"], metrics["generalization_score"], metrics["locality_score"]
     
     def _setup_gradient_masking(self, param_mask: Dict[str, torch.Tensor]):
         """Setup gradient masking without changing requires_grad globally"""
@@ -354,19 +484,23 @@ class AdversarialLocalizationProblem(Problem):
             if hasattr(param, '_grad_mask') and param.grad is not None:
                 param.grad *= param._grad_mask.float()
     
-    def _finetune_and_evaluate_efficient(self) -> Dict[str, float]:
+    def _finetune_and_evaluate_efficient(self, rec: Dict) -> Dict[str, float]:
         """Efficient fine-tuning with proper metric evaluation"""
         # Setup optimizer for selected parameters only
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        if not trainable_params:
+            # penalise this mask so GA moves away from it
+            return dict(rewrite_score=0.0, generalization_score=0.0, locality_score=0.0)
         optimizer = torch.optim.AdamW(trainable_params, lr=self.config.ft_lr, eps=1e-8)
         
         # Extract data from record
-        request = self.record["requested_rewrite"]
+        request = rec["requested_rewrite"]
         subject = request["subject"]
         prompt = request["prompt"].format(subject)
         target_new = request["target_new"]["str"]
         
         # Fine-tuning loop
+        # with stopwatch("fine-tune loop"):
         self.model.train()
         for step in range(self.config.ft_steps):
             # Tokenize prompt and target with proper device placement
@@ -381,7 +515,7 @@ class AdversarialLocalizationProblem(Problem):
                 with torch.cuda.amp.autocast():
                     outputs = self.model(**inputs)
                     logits = outputs.logits[0, -1, :].unsqueeze(0)
-                    loss = torch.nn.functional.cross_entropy(logits, target_ids[0, 0].unsqueeze(0))
+                    loss = _safe_cross_entropy(logits, target_ids[0, 0].unsqueeze(0))
                 
                 # Backward pass with gradient scaling
                 optimizer.zero_grad()
@@ -389,9 +523,17 @@ class AdversarialLocalizationProblem(Problem):
                 self._mask_gradients()
                 
                 # Apply gradient clipping before unscaling
-                if self.config.ft_norm_constraint > 0:
-                    self.grad_scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(trainable_params, self.config.ft_norm_constraint)
+                if self.grad_scaler is not None and self.config.ft_norm_constraint > 0:
+                    # --- NEW robust guard ----------------------------------------------------
+                    has_fp16_grad = any(
+                        (p.grad is not None) and (p.grad.dtype == torch.float16)
+                        for pg in optimizer.param_groups for p in pg['params']
+                    )
+                    # -------------------------------------------------------------------------
+                    if has_fp16_grad:                           # only then unscale + clip
+                        self.grad_scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(trainable_params,
+                                                    self.config.ft_norm_constraint)
                 
                 self.grad_scaler.step(optimizer)
                 self.grad_scaler.update()
@@ -399,7 +541,7 @@ class AdversarialLocalizationProblem(Problem):
                 # Standard precision
                 outputs = self.model(**inputs)
                 logits = outputs.logits[0, -1, :].unsqueeze(0)
-                loss = torch.nn.functional.cross_entropy(logits, target_ids[0, 0].unsqueeze(0))
+                loss = _safe_cross_entropy(logits, target_ids[0, 0].unsqueeze(0))
                 
                 optimizer.zero_grad()
                 loss.backward()
@@ -411,10 +553,13 @@ class AdversarialLocalizationProblem(Problem):
                 optimizer.step()
         
         # Evaluate using proper CounterFact metrics
+        # with stopwatch("CounterFact eval"):
         self.model.eval()
         with torch.no_grad():
+            # metrics = self._evaluate_counterfact_metrics()
+            self.record = rec          # small hack: helper expects it
             metrics = self._evaluate_counterfact_metrics()
-        
+            
         return metrics
     
     def _evaluate_counterfact_metrics(self) -> Dict[str, float]:
@@ -444,6 +589,38 @@ class AdversarialLocalizationProblem(Problem):
         except Exception as e:
             warnings.warn(f"CounterFact eval failed → dense fallback.  ({e})")
             return self._dense_fallback_metrics()
+        
+    # ------------------------------------------------------------------ #
+    #  Aggregate over the fixed record-set                               #
+    # ------------------------------------------------------------------ #
+    def _score_mask(self, param_mask):
+        # ---------- forward sanity check ------------------------------
+        with torch.no_grad():
+            try:
+                self._setup_gradient_masking(param_mask)        # reuse
+                dummy = self.tokenizer("hello", return_tensors="pt").to(self.device)
+                if not torch.isfinite(self.model(**dummy).logits).all():
+                    return 0.0, 0.0, 0.0        # mask is toxic -> bad fitness
+            finally:
+                # restore a clean state for the real evaluation
+                for p in self.model.parameters():
+                    p.requires_grad = False
+
+        # ---------- true evaluation -----------------------------------
+        r = g = l = 0.0
+        for rec in self.records:
+            ri, gi, li = self._evaluate_on_record(rec, param_mask)
+            r += ri; g += gi; l += li
+        n = len(self.records)
+        return r/n, g/n, l/n
+
+
+    # helper that was formerly _compute_fitness, now pure:
+    def _combine(self, r, g, l):
+        w_r = self.config.rewrite_weight
+        w_g = self.config.generalization_weight
+        w_l = self.config.locality_weight
+        return (w_r*r + w_g*g + w_l*l) / (w_r + w_g + w_l)
         
     def _dense_fallback_metrics(self) -> Dict[str, float]:
         """
@@ -558,23 +735,6 @@ class AdversarialLocalizationProblem(Problem):
         return float(np.mean(margins))
     
     
-    def _extract_locality_score(self, neighborhood_probs: List[Dict]) -> float:
-        """Extract locality preservation score"""
-        if not neighborhood_probs:
-            # If no neighbors, return neutral score (don't penalize or reward)
-            return 0.5 if not self.config.skip_no_neighbors else 1.0
-        
-        preservation_count = 0
-        for prob_dict in neighborhood_probs:
-            # For locality, we want the request_baseline to remain higher
-            target_new_prob = prob_dict.get('target_new', float('-inf'))
-            request_baseline_prob = prob_dict.get('request_baseline', float('-inf'))
-            
-            if request_baseline_prob >= target_new_prob:
-                preservation_count += 1
-        
-        return preservation_count / len(neighborhood_probs)
-    
     def _evaluate_simple_metrics(self) -> Dict[str, float]:
         """Fallback simple evaluation"""
         request = self.record["requested_rewrite"]
@@ -599,30 +759,6 @@ class AdversarialLocalizationProblem(Problem):
             'generalization_score': rewrite_score * 0.8,  # Approximate
             'locality_score': 0.5  # Neutral
         }
-    
-    def _compute_fitness(self, metrics: Dict[str, float]) -> float:
-        """
-        Combine dense metrics into a single fitness value (higher = better).
-        Pymoo still minimises, so caller negates later.
-        """
-        # locality may be missing if record lacks neighbours
-        loc_w = 0.0 if ("locality_score" not in metrics and self.config.locality_weight > 0) else self.config.locality_weight
-        
-        w_r = self.config.rewrite_weight
-        w_g = self.config.generalization_weight
-        w_l = loc_w
-        total_w = w_r + w_g + w_l
-
-        if total_w == 0:
-            return 0.0
-
-        # Each metric is already in [0,1] after soft_success
-        fitness = (
-            w_r * metrics.get('rewrite_score',        0.0) +
-            w_g * metrics.get('generalization_score',0.0) +
-            w_l * metrics.get('locality_score',       0.0)
-        ) / total_w
-        return float(fitness)
 
 
 class AdversarialProgressCallback(Callback):
@@ -644,6 +780,11 @@ class AdversarialProgressCallback(Callback):
             
             self.data["best_fitness"].append(best_fitness)
             self.data["avg_fitness"].append(avg_fitness)
+            
+            if algorithm.n_gen % 1 == 0:          # every generation
+                gen_time = time.perf_counter() - algorithm.start_time
+                print(f"[T] ← Generation {algorithm.n_gen:02d} finished in {gen_time:5.2f}s")
+                algorithm.start_time = time.perf_counter()   # reset
             
             if algorithm.n_gen % 5 == 0:
                 # Memory monitoring
@@ -684,6 +825,9 @@ def run_adversarial_localization_per_datapoint(
     if config.use_fp16:
         model = model.half()
     
+    fixed_eval_set = RNG.sample(dataset, k=min(config.fixed_eval_size, len(dataset)))
+    print(f"[eval-set] Using {len(fixed_eval_set)} records for every fitness call")
+    
     for i, record in enumerate(dataset):
         record_id = record.get('case_id', record.get('uuid', str(i)))
         print(f"\n{'='*60}")
@@ -693,7 +837,9 @@ def run_adversarial_localization_per_datapoint(
         
         try:
             # Create problem for this record
-            problem = AdversarialLocalizationProblem(model, tokenizer, record, config)
+            problem = AdversarialLocalizationProblem(model, tokenizer,
+                                         fixed_eval_set,  # <-- not one record
+                                         config)
             
             # Setup algorithm with proper operators
             if config.search_mode == "layer":
@@ -705,8 +851,12 @@ def run_adversarial_localization_per_datapoint(
                 # For single variable, crossover doesn't matter much
                 crossover = SBX(prob=0.0)  # Disable crossover
             else:
-                # For scalar mode (not implemented yet - would need different operators)
-                raise NotImplementedError("Scalar mode needs additional implementation")
+                print("Scalar mode detedted")
+                n = problem.target_param_count
+                sampling  = PermutationRandomSampling()
+                crossover = OrderCrossover(prob=config.crossover_prob)
+                mutation  = InversionMutation(prob=config.mutation_prob)
+                repair = ScalarRepair(problem.total_editable, n)
             
             algorithm = GA(
                 pop_size=config.population_size,
@@ -716,6 +866,8 @@ def run_adversarial_localization_per_datapoint(
                 repair=repair,
                 eliminate_duplicates=False  # Allow duplicates for small search space
             )
+            algorithm.start_time = time.perf_counter()
+            print("[T] GA initial population being created …")
             
             # Setup progress tracking
             callback = AdversarialProgressCallback(config, str(record_id))
@@ -820,30 +972,31 @@ def run_adversarial_localization_per_datapoint(
 
 # Example usage
 if __name__ == "__main__":
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from dsets import CounterFactDataset
+    mp.set_start_method("spawn", force=True)   # ← add this first
     
     # Load GPT-J 6B model
-    model_name = "EleutherAI/gpt-j-6b"
+    # model_name = "EleutherAI/gpt-j-6b"
+    model_name = "openai-community/gpt2"
     print(f"Loading {model_name}...")
     
     model = AutoModelForCausalLM.from_pretrained(
         model_name, 
-        torch_dtype=torch.float16,
+        torch_dtype=torch.float32,
         device_map="auto"  # For multi-GPU setups
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
     
     # Load dataset
-    dataset = CounterFactDataset("data", size=20)  # Small test set
+    dataset = CounterFactDataset("data", size=10)  # Small test set
+    
     
     # Configure for production
     config = AdversarialConfig(
         model_name=model_name,
         search_mode="",                # search_mode="layer",
-        population_size=25,          # Reasonable for layer search
-        max_generations=20,
+        population_size=20,          # Reasonable for layer search
+        max_generations=100,
         
         # Balanced metric weights
         rewrite_weight=1.0,
@@ -853,16 +1006,26 @@ if __name__ == "__main__":
         
         # Efficient fine-tuning
         ft_steps=25,
-        ft_lr=5e-5,
-        use_fp16=True,
+        ft_lr=1e-5,
+        use_fp16=False,
         use_grad_scaler=True,
         
-        save_dir="production_adversarial_results"
+        # Target parameter count
+        target_param_count=None,
+        fixed_eval_size=100,           # Small eval set for efficiency
+        
+        save_dir="production_adversarial_results2"
     )
+    config.use_fp16 = False
+    config.use_grad_scaler = False
+
     
+    launch_parallel(dataset, config,
+                gpus=[0],        # which CUDA devices to use
+                workers_per_gpu=1)     # bump to 2 if memory allows
     # Run adversarial localization
-    results = run_adversarial_localization_per_datapoint(
-        model, tokenizer, list(dataset), config
-    )
+    # results = run_adversarial_localization_per_datapoint(
+    #     model, tokenizer, list(dataset), config
+    # )
     
     print(f"\nExperiment complete! Processed {len(results)} records.")
