@@ -5,7 +5,7 @@ from scipy.stats import ttest_ind
 # Load data
 base = '/mnt/sda/hoyeon/belief-localization/results/'
 df_rome = pd.read_csv(f'{base}/gpt2-medium_ROME_outputs_cf_editing_sweep_ws-[1]_layer-all_n50.csv')
-df_noise = pd.read_csv(f'{base}/gpt2-medium_ROME_NOISE-scaled_random_outputs_cf_editing_sweep_ws-[1]_layer-all_n50.csv')
+df_noise = pd.read_csv(f'{base}/gpt2-medium_ROME_NOISE_outputs_cf_editing_sweep_ws-[1]_layer-all_n50.csv')
 
 print("Data shapes:")
 print(f"ROME: {df_rome.shape}, NOISE: {df_noise.shape}")
